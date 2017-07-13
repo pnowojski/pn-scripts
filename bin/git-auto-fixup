@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+
+for f in `git ls-files -m`
+do
+    git commit --fixup=`git log -n 1 --pretty=format:%H -- $f` -- $f 
+done
