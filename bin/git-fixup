@@ -1,0 +1,284 @@
+#!/usr/bin/env python
+
+"""
+A custom Git command to quickly create fixup commits in preparation for an
+interactive rebase.
+
+git-fixup will examine each changed line of each modified file, determine the
+last commit which touched the line, and create a fixup commit targetting that
+commit.
+
+Usage:
+
+    git fixup [path]
+
+        If path is given, only that file is processed.
+        If path is omitted, all modified files are processed.
+
+Limitations:
+
+* git-fixup will only attempt to patch files with simple changes. "Simple"
+  means that either:
+
+  1. the number of lines in a changed area has stayed the same, in which case
+     git-fixup will assume that the change to each line can be individually
+     fixedup on the commit that last touched the line, or
+
+  2. that a group of changed lines only affects lines that were last touched
+     by a single commit, in which case git-fixup will fixup the whole group
+     of changes onto that one commit.
+
+Problems:
+
+* git-fixup makes no attempt to work out if the commit it's fixing up is
+  appropriate, e.g. it could be a commit already merged into master.
+"""
+
+from __future__ import print_function
+from collections import defaultdict
+from itertools import izip_longest
+import difflib
+import re
+import subprocess
+import sys
+
+BLAME_PATTERN = re.compile(
+    r"^\^?(?P<commit>[^ ]+) \(.* (?P<line_number>\d+)\) (?P<contents>.*)$",
+)
+STATUS_PATTERN = re.compile(r"^(?P<status>..)\s+(?P<path>.*)( -> .*)?$")
+
+
+class Status(object):
+    MODIFIED_NOT_STAGED = " M"
+    UNTRACKED = "??"
+
+    def modified_paths(self):
+        return [
+            status["path"]
+            for status in self.statuses()
+            if status["status"] == self.MODIFIED_NOT_STAGED
+        ]
+
+    def indexed_paths(self):
+        return [
+            status["path"]
+            for status in self.statuses()
+            if (
+                status["status"] != self.UNTRACKED and
+                status["status"][0] != " "
+            )
+        ]
+
+    def statuses(self):
+        cmd = ["git", "status", "--porcelain"]
+        return [
+            STATUS_PATTERN.match(line).groupdict()
+            for line in subprocess.check_output(cmd).splitlines()
+        ]
+
+
+class Line(object):
+    @classmethod
+    def from_blame(cls, working, head, commit=None):
+        if working is None:
+            working = {}
+
+        if head is None:
+            head = {}
+
+        return cls(
+            changed=(working.get("contents") != head.get("contents")),
+            old_contents=head.get("contents"),
+            new_contents=working.get("contents"),
+            last_commit=head.get("commit", commit),
+        )
+
+    def __init__(
+        self, changed, old_contents, new_contents, last_commit,
+    ):
+        self.applied = False
+        self.changed = changed
+        self.old_contents = old_contents
+        self.new_contents = new_contents
+        self.last_commit = last_commit
+
+    def contents_for_context(self):
+        if self.applied:
+            return self.new_contents
+        else:
+            return self.old_contents
+
+
+class File(object):
+    class AmbiguousSection(Exception):
+        pass
+
+    def __init__(self, path):
+        self.path = path
+
+    def apply_patches(self):
+        for commit, patch in self.patches():
+            process = subprocess.Popen(
+                ["git", "apply", "-v", "--cached", "-"],
+                stdin=subprocess.PIPE,
+            )
+            process.communicate(patch)
+            subprocess.check_output(["git", "commit", "--fixup", commit])
+
+    def patches(self):
+        patches = defaultdict(list)
+        for line in self.lines():
+            if line.changed:
+                patches[line.last_commit].append(line)
+
+        return [
+            self._build_patch(commit, lines)
+            for (commit, lines) in patches.items()
+        ]
+
+    def _build_patch(self, commit, changed_lines):
+        before = []
+        after = []
+
+        for line in self.lines():
+            if line in changed_lines:
+                before.append(line.old_contents)
+                after.append(line.new_contents)
+                line.applied = True
+            else:
+                before.append(line.contents_for_context())
+                after.append(line.contents_for_context())
+
+        before = [line + "\n" for line in before if line is not None]
+        after = [line + "\n" for line in after if line is not None]
+
+        patch = difflib.unified_diff(
+            before,
+            after,
+            fromfile="a/{0}".format(self.path),
+            tofile="b/{0}".format(self.path),
+        )
+
+        return commit, "".join(patch)
+
+    def lines(self):
+        if not hasattr(self, "_lines"):
+            self._lines = []
+            head = self.head_blame()
+            working = self.working_blame()
+            diffable_head = [
+                "{commit} {contents}".format(**blame) for blame in head
+            ]
+            diffable_working = [
+                "{commit} {contents}".format(**blame) for blame in working
+            ]
+            sequence_matcher = difflib.SequenceMatcher(
+                a=diffable_head,
+                b=diffable_working,
+            )
+
+            head_index = 0
+            working_index = 0
+
+            for block in sequence_matcher.get_matching_blocks():
+                unmatching_head = head[head_index:block.a]
+                unmatching_working = working[working_index:block.b]
+
+                matching_head = head[block.a:block.a + block.size]
+                matching_working = working[block.b:block.b + block.size]
+
+                if len(unmatching_head) == len(unmatching_working):
+                    self._lines.extend(self._lines_from_pairs(
+                        unmatching_head,
+                        unmatching_working,
+                    ))
+                else:
+                    self._lines.extend(self._lines_from_unmatched_sections(
+                        unmatching_head,
+                        unmatching_working,
+                    ))
+
+                self._lines.extend(self._lines_from_pairs(
+                    matching_head,
+                    matching_working,
+                ))
+
+                head_index = block.a + block.size
+                working_index = block.b + block.size
+
+        return self._lines
+
+    def _lines_from_pairs(self, head_lines, working_lines):
+        return [
+            Line.from_blame(working, head)
+            for (head, working) in zip(head_lines, working_lines)
+        ]
+
+    def _lines_from_unmatched_sections(self, head_lines, working_lines):
+        commits = set([head_line["commit"] for head_line in head_lines])
+
+        if len(commits) == 1:
+            commit = commits.pop()
+            return [
+                Line.from_blame(working, head, commit)
+                for (head, working) in izip_longest(head_lines, working_lines)
+            ]
+        else:
+            raise self.AmbiguousSection()
+
+    def working_blame(self):
+        if not hasattr(self, "_working_blame"):
+            cmd = ["git", "blame", "--", self.path]
+            self._working_blame = [
+                BLAME_PATTERN.match(line).groupdict()
+                for line
+                in subprocess.check_output(cmd).splitlines()
+            ]
+
+        return self._working_blame
+
+    def head_blame(self):
+        if not hasattr(self, "_head_blame"):
+            cmd = ["git", "blame", "HEAD", "--", self.path]
+            self._head_blame = [
+                BLAME_PATTERN.match(line).groupdict()
+                for line
+                in subprocess.check_output(cmd).splitlines()
+            ]
+
+        return self._head_blame
+
+
+class CLI(object):
+    def __init__(self, args):
+        self.args = args
+        self.status = Status()
+
+    def run(self):
+        if len(self.status.indexed_paths()) > 0:
+            print(
+                "Cannot fixup while there are changes in the index",
+                file=sys.stderr
+            )
+            sys.exit(1)
+
+        for path in self.paths():
+            f = File(path)
+
+            try:
+                f.apply_patches()
+            except File.AmbiguousSection:
+                print(
+                    "Skipping {0}: ambiguous section".format(f.path),
+                    file=sys.stderr,
+                )
+
+    def paths(self):
+        if len(self.args) == 1:
+            return self.status.modified_paths()
+        elif len(self.args) == 2:
+            return [self.args[1]]
+
+
+if __name__ == "__main__":
+    CLI(sys.argv).run()
