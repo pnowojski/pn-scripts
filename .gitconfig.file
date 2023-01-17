@@ -1,0 +1,30 @@
+[user]
+    name = Piotr Nowojski
+    email = piotr.nowojski@gmail.com
+[core]  
+    editor = vim
+[alias]
+    #Displays all local branches in the order of their last commit, allowing to see what you worked on when.
+    branches = !"git for-each-ref --sort='authordate:iso8601' --format=' %(color:green)%(authordate:iso8601)%09%(color:white)%(refname:short)' refs/heads"
+    sort = rebase "$(git merge-base HEAD master)" -x 'git commit --amend -C HEAD --date="$(date -R)" && sleep 1.05'
+    br = branch
+    bd = branch -d
+    ca = commit --amend
+    cb = checkout -b
+    ci = commit
+    co = checkout
+    l = log
+    ll = log --pretty=format:"%C(yellow)%h%Cred%d\\ %Creset%s%Cblue\\ [%an]" --decorate --numstat
+    ld = log --pretty=format:"%C(yellow)%h\\ %C(green)%ad%Cred%d\\ %Creset%s%Cblue\\ [%an]" --decorate --date=short --graph
+    ls = log --pretty=format:"%C(green)%h\\ %C(yellow)[%ad]%Cred%d\\ %Creset%s%Cblue\\ [%an]" --decorate --date=relative
+    mm = merge --no-ff
+    st = status
+    tg = tag -a
+[color]  
+    diff = auto  
+    status = auto  
+    branch = auto 
+[branch]  
+    autosetuprebase = always
+[rerere]
+	enabled = 1
