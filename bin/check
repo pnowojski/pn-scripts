@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+
+$@ && say command completed || say command failed
